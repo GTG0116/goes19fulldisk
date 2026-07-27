@@ -1,0 +1,13 @@
+# Generated satellite imagery is NEVER committed.
+#
+# Each run rewrites every product's newest frame, and a PNG is a fresh binary
+# blob that git cannot delta-compress against the previous one — roughly
+# 600 MB of new objects per day at the 10-minute update cadence.  Superseded
+# blobs stay stored server-side even after they become unreachable, so no
+# commit strategy (append, amend, or orphan force-push) bounds the repository
+# size.  The frames are published to GitHub Pages as a deployment artifact
+# instead; see the header of .github/workflows/main.yml.
+site/data/
+
+__pycache__/
+*.pyc
