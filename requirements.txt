@@ -5,3 +5,4 @@ cartopy
 scipy
 xarray
 netCDF4
+pillow

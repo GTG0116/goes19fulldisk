@@ -1,5 +1,43 @@
 name: Update Satellite Data
 
+# ---------------------------------------------------------------------------
+# Why this workflow does not commit the imagery
+# ---------------------------------------------------------------------------
+# Every run rewrites the newest frame of each product, and a PNG is a fresh
+# binary blob that git can never delta-compress against the previous one.  At
+# ~4 MB per cycle every 10 minutes that is ~600 MB of new objects per day.
+#
+# Committing them and later dropping them does NOT reclaim the space.  Neither
+# amending the previous snapshot nor force-pushing an orphan commit helps:
+# both leave the superseded blobs *unreachable but still stored* server-side,
+# and GitHub does not garbage-collect them on any schedule you control.  The
+# sibling repositories that took the amend approach measure 87 GB and 58 GB
+# server-side (GET /repos/{owner}/{repo} → .size) against a 5 GB hard limit,
+# while their clones look like a harmless 200 MB.
+#
+# So the imagery is never written to git at all.  site/data is gitignored; the
+# frames are generated in the runner and published straight to GitHub Pages as
+# a deployment artifact, which does not count against the repository size.
+# The repository therefore stays at its source-code size (~100 KB) forever, no
+# matter how long the stream runs.
+#
+# The 10-frame rolling animation buffer is carried between runs by the Actions
+# cache, with the live site as a cold-start fallback (see restore_frames.py).
+#
+# The frames themselves are unchanged — same filenames, same 10-frame rolling
+# buffer, same cadence, same `site/data/` path, same permissive CORS header.
+# Only the host that serves them changes, so a downstream consumer swaps:
+#
+#   https://raw.githubusercontent.com/GTG0116/goes19fulldisk/main/site/data/X.png
+#   https://gtg0116.github.io/goes19fulldisk/site/data/X.png
+#
+# Pages is also the better origin for this: it is CDN-backed, whereas
+# raw.githubusercontent.com is not intended to be used as one.
+#
+# NOTE: this requires Pages to be served from Actions —
+# Settings → Pages → Build and deployment → Source: "GitHub Actions".
+# ---------------------------------------------------------------------------
+
 on:
   repository_dispatch:
     types: [satellite_update] # This is the event type cron-job.org will send
@@ -8,11 +46,23 @@ on:
   #   - cron: '0 * * * *'  # Commented out so it relies purely on cron-job.org
 
 permissions:
-  contents: write  # Needed to commit updated images back to the repo
+  contents: read   # nothing is ever pushed back to the repository
+  pages: write     # publish the generated frames to GitHub Pages
+  id-token: write  # required by actions/deploy-pages
+
+# Let a run finish rather than cancelling it — a cancelled run would publish
+# nothing and the site would go stale for a cycle.
+concurrency:
+  group: pages
+  cancel-in-progress: false
 
 jobs:
   update-satellite:
     runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
 
     steps:
       - name: Checkout Code
@@ -39,14 +89,60 @@ jobs:
             sleep 10
           done
 
+      # The cache is the normal path back to the previous run's frames.  The
+      # key is unique per run so every run writes a fresh entry; restore-keys
+      # then matches the most recent one.  GitHub evicts these automatically
+      # under its own 10 GB cache budget, so they cannot accumulate.
+      - name: Restore Frame Buffer (cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: site/data
+          key: satellite-frames-${{ github.run_id }}
+          restore-keys: satellite-frames-
+
+      # Fallback for a cold start or an evicted cache: pull the frames back
+      # off the site that is already live.  Best-effort; never fails the job.
+      - name: Restore Frame Buffer (live site fallback)
+        env:
+          SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+        run: python restore_frames.py
+
       - name: Generate Satellite Images
         run: python process_data.py
 
-      - name: Commit and Push Images to Repository
+      - name: Save Frame Buffer (cache)
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: site/data
+          key: satellite-frames-${{ github.run_id }}
+
+      # Publish the frames under BOTH path shapes so existing consumers only
+      # have to change hostname, never path:
+      #
+      #   .../goes19fulldisk/site/data/X.png   mirrors the raw.githubusercontent
+      #                                        path, and matches how Pages
+      #                                        already serves Goes18satellite
+      #   .../goes19fulldisk/data/X.png        site-root form, used by the
+      #                                        relative links in index.html
+      #
+      # The duplicate only exists inside the deployment artifact, so it costs
+      # nothing against the repository size.
+      - name: Assemble Pages Site
         run: |
-          git config user.name  "GitHub Actions Bot"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add site/data/
-          # Only commit if something actually changed
-          git diff --staged --quiet || git commit -m "chore: update satellite images [$(date -u '+%Y-%m-%d %H:%M UTC')]"
-          git push
+          rm -rf _publish
+          mkdir -p _publish
+          cp -r site/. _publish/
+          mkdir -p _publish/site
+          cp -r site/. _publish/site/
+          echo "Publishing $(find _publish -type f | wc -l) files:"
+          du -sh _publish
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _publish
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
